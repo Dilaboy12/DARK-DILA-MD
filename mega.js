@@ -1,68 +1,103 @@
 const fs = require("fs");
 const { Storage, File } = require("megajs");
 
-async function getStorage() {
+async function upload(filePath, fileName) {
+    if (!fs.existsSync(filePath)) {
+        throw new Error("Session archive not found: " + filePath);
+    }
+
     const email = process.env.MEGA_EMAIL;
     const password = process.env.MEGA_PASSWORD;
 
     if (!email || !password) {
-        throw new Error(
-            "MEGA_EMAIL or MEGA_PASSWORD GitHub Secrets are missing."
-        );
+        throw new Error("MEGA_EMAIL or MEGA_PASSWORD is missing.");
     }
 
-    return await new Storage({
-        email,
-        password,
-        keepalive: false
-    }).ready;
-}
+    const stat = fs.statSync(filePath);
 
-async function upload(filePath, fileName) {
-    if (!fs.existsSync(filePath)) {
-        throw new Error("Upload file not found: " + filePath);
+    if (!stat.size) {
+        throw new Error("Session archive is empty.");
     }
 
-    const storage = await getStorage();
+    let storage;
 
     try {
-        const stat = fs.statSync(filePath);
+        console.log("[MEGA] Connecting to account...");
+
+        storage = await new Storage({
+            email,
+            password,
+            keepalive: false
+        }).ready;
+
+        console.log("[MEGA] Account connected.");
+        console.log("[MEGA] Uploading:", fileName);
+        console.log("[MEGA] File size:", stat.size);
+
         const stream = fs.createReadStream(filePath);
 
-        const uploaded = await storage.upload({
+        const uploadStream = storage.upload({
             name: fileName,
             size: stat.size
-        }, stream).complete;
+        }, stream);
 
-        const url = await uploaded.link();
+        const uploadedFile = await uploadStream.complete;
 
-        if (!url || !url.includes("#")) {
-            throw new Error("MEGA did not return a valid private file link.");
+        console.log("[MEGA] Upload completed.");
+        console.log("[MEGA] Creating private file link...");
+
+        const url = await uploadedFile.link();
+
+        if (!url) {
+            throw new Error("MEGA returned an empty file link.");
         }
 
+        console.log("[MEGA] Private link created.");
+
         return url;
+
+    } catch (error) {
+        throw new Error(
+            "[MEGA UPLOAD] " + (error.message || String(error))
+        );
     } finally {
-        storage.close();
+        if (storage) {
+            try {
+                storage.close();
+            } catch {}
+        }
     }
 }
 
 async function download(url) {
-    if (!url || typeof url !== "string") {
-        throw new Error("Invalid MEGA download URL.");
+    if (!url) {
+        throw new Error("MEGA download URL is missing.");
     }
 
-    if (!/^https:\/\/mega\.(nz|co\.nz)\//i.test(url)) {
-        throw new Error("Only valid MEGA file links are accepted.");
+    try {
+        console.log("[MEGA] Opening session file...");
+
+        const file = File.fromURL(url);
+
+        await file.loadAttributes();
+
+        console.log("[MEGA] Downloading:", file.name);
+
+        const buffer = await file.downloadBuffer();
+
+        if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+            throw new Error("Downloaded session archive is empty.");
+        }
+
+        console.log("[MEGA] Download completed.");
+
+        return buffer;
+
+    } catch (error) {
+        throw new Error(
+            "[MEGA DOWNLOAD] " + (error.message || String(error))
+        );
     }
-
-    const file = File.fromURL(url);
-    const buffer = await file.downloadBuffer();
-
-    if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
-        throw new Error("Downloaded MEGA session archive is empty.");
-    }
-
-    return buffer;
 }
 
 module.exports = {
