@@ -1,101 +1,57 @@
+const baileys = require("@whiskeysockets/baileys");
+const makeWASocket = baileys.default;
 const {
-    default: makeWASocket,
     useMultiFileAuthState,
-    DisconnectReason,
     fetchLatestBaileysVersion,
-    Browsers,
-    jidNormalizedUser
-} = require("@whiskeysockets/baileys");
+    DisconnectReason,
+    Browsers
+} = baileys;
 
 const pino = require("pino");
 const fs = require("fs");
 const path = require("path");
-
+const os = require("os");
+const { execFileSync } = require("child_process");
+const mega = require("./mega");
 const config = require("./config");
-const functions = require("./lib/functions");
-const database = require("./lib/database");
-const commands = require("./lib/commands");
-
-// ========================================
-// DARK DILA-MD CONFIGURATION
-// ========================================
-
-const BOT_NAME = config.BOT_NAME || "DARK DILA-MD";
-const PREFIX = config.PREFIX || ".";
-const OWNER_NUMBER = String(config.OWNER_NUMBER || "").replace(/\D/g, "");
 
 const SESSION_DIR = path.join(__dirname, "session");
 const PLUGIN_DIR = path.join(__dirname, "plugins");
+const TEMP_DIR = path.join(os.tmpdir(), "dark-dila-session");
+const ARCHIVE = path.join(os.tmpdir(), "dark-dila-session.tar.gz");
+
+const PREFIX = config.PREFIX || ".";
+const OWNER = String(process.env.OWNER_NUMBER || config.OWNER_NUMBER || "").replace(/\D/g, "");
+const logger = pino({ level: "silent" });
 
 let sock;
 let reconnectTimer;
-let isStarting = false;
-let isStopping = false;
+let pairingStarted = false;
+let sessionUploaded = false;
+let stopping = false;
+let commands = new Map();
 
-const logger = pino({
-    level: "silent"
-});
-
-const startTime = Date.now();
-
-// ========================================
-// DIRECTORY SETUP
-// ========================================
-
-function createDirectories() {
-    [SESSION_DIR, PLUGIN_DIR, path.join(__dirname, "data")].forEach(dir => {
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-    });
+function cleanDirectories() {
+    fs.mkdirSync(SESSION_DIR, { recursive: true });
+    fs.mkdirSync(PLUGIN_DIR, { recursive: true });
 }
 
-// ========================================
-// SESSION PREFIX HANDLER
-// ========================================
+function getSessionUrl() {
+    const value = String(process.env.SESSION_ID || "").trim();
+    const prefix = "DARK DILA-MD=";
 
-function getSessionData() {
-    const sessionId = String(config.SESSION_ID || "").trim();
-    const prefix = config.SESSION_PREFIX || "THENUVA-XMD=";
+    if (!value) return "";
 
-    if (!sessionId) return "";
-
-    if (sessionId.startsWith(prefix)) {
-        return sessionId.slice(prefix.length).trim();
+    if (!value.startsWith(prefix)) {
+        throw new Error("SESSION_ID must start with DARK DILA-MD=");
     }
 
-    return sessionId;
+    return value.slice(prefix.length).trim();
 }
-
-// A session prefix is not itself an authentication session.
-// This base restores credentials from the local session directory.
-// An external session-data provider must be implemented separately
-// before getSessionData() can restore a remote session.
-
-// ========================================
-// OWNER CHECK
-// ========================================
-
-function isOwner(jid) {
-    if (!OWNER_NUMBER || !jid) return false;
-
-    const sender = jidNormalizedUser(jid)
-        .split("@")[0]
-        .replace(/\D/g, "");
-
-    return sender === OWNER_NUMBER;
-}
-
-// ========================================
-// PLUGIN LOADER
-// ========================================
 
 function loadPlugins() {
     commands.clear();
-
-    if (!fs.existsSync(PLUGIN_DIR)) {
-        fs.mkdirSync(PLUGIN_DIR, { recursive: true });
-    }
+    fs.mkdirSync(PLUGIN_DIR, { recursive: true });
 
     const files = fs.readdirSync(PLUGIN_DIR)
         .filter(file => file.endsWith(".js"));
@@ -105,158 +61,208 @@ function loadPlugins() {
 
         try {
             delete require.cache[require.resolve(filePath)];
-
             const plugin = require(filePath);
 
-            if (commands.register(plugin)) {
-                console.log(`[PLUGIN] Loaded: ${file}`);
+            if (!plugin.command || typeof plugin.handler !== "function") {
+                console.log(`[PLUGIN SKIP] ${file}: invalid plugin format`);
+                continue;
             }
+
+            const names = Array.isArray(plugin.command)
+                ? plugin.command
+                : [plugin.command];
+
+            for (const name of names) {
+                commands.set(String(name).toLowerCase(), plugin);
+            }
+
+            console.log(`[PLUGIN] Loaded: ${file}`);
         } catch (error) {
             console.error(`[PLUGIN ERROR] ${file}:`, error.message);
         }
     }
 
-    console.log(`[PLUGIN] Total commands: ${commands.getAll().length}`);
+    console.log(`[PLUGIN] Total commands: ${commands.size}`);
 }
 
-// ========================================
-// MESSAGE TEXT
-// ========================================
+function createArchive() {
+    if (fs.existsSync(ARCHIVE)) fs.unlinkSync(ARCHIVE);
+
+    execFileSync("tar", [
+        "-czf",
+        ARCHIVE,
+        "-C",
+        __dirname,
+        "session"
+    ]);
+}
+
+async function restoreSession() {
+    const url = getSessionUrl();
+
+    if (!url) {
+        console.log("[SESSION] No SESSION_ID. Pair Code login required.");
+        return false;
+    }
+
+    console.log("[SESSION] Downloading existing MEGA session...");
+
+    const buffer = await mega.download(url);
+
+    fs.rmSync(TEMP_DIR, { recursive: true, force: true });
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+
+    fs.writeFileSync(ARCHIVE, buffer);
+
+    execFileSync("tar", [
+        "-xzf",
+        ARCHIVE,
+        "-C",
+        TEMP_DIR
+    ]);
+
+    const restored = path.join(TEMP_DIR, "session");
+
+    if (!fs.existsSync(path.join(restored, "creds.json"))) {
+        throw new Error("Downloaded archive does not contain session/creds.json");
+    }
+
+    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+    fs.cpSync(restored, SESSION_DIR, { recursive: true });
+
+    fs.rmSync(TEMP_DIR, { recursive: true, force: true });
+    fs.rmSync(ARCHIVE, { force: true });
+
+    console.log("[SESSION] Existing WhatsApp session restored.");
+    return true;
+}
+
+async function uploadSession() {
+    if (sessionUploaded) return;
+    sessionUploaded = true;
+
+    try {
+        console.log("[SESSION] Creating complete session archive...");
+
+        createArchive();
+
+        const url = await mega.upload(
+            ARCHIVE,
+            `DARK_DILA_MD_SESSION_${Date.now()}.tar.gz`
+        );
+
+        const sessionId = `DARK DILA-MD=${url}`;
+
+        console.log("[SESSION] Upload successful.");
+
+        const number = String(
+            process.env.PAIRING_NUMBER || ""
+        ).replace(/\D/g, "");
+
+        const target = number || OWNER;
+
+        if (target) {
+            await sock.sendMessage(`${target}@s.whatsapp.net`, {
+                text:
+                    `✅ DARK DILA-MD Connected!\n\n` +
+                    `🔐 SESSION ID:\n\n${sessionId}\n\n` +
+                    `⚠️ Keep this Session ID private.\n` +
+                    `Save it in GitHub Secrets as SESSION_ID.`
+            });
+        }
+
+        console.log("[SESSION] Session ID sent to WhatsApp.");
+        console.log("[SESSION] Save the SESSION_ID secret before the next run.");
+
+        fs.rmSync(ARCHIVE, { force: true });
+    } catch (error) {
+        sessionUploaded = false;
+        console.error("[SESSION UPLOAD ERROR]", error.message);
+    }
+}
+
+function isOwner(jid) {
+    const number = String(jid || "")
+        .split("@")[0]
+        .replace(/\D/g, "");
+
+    return Boolean(OWNER && number === OWNER);
+}
 
 function getText(message) {
-    if (!message) return "";
-
-    const msg = message.message || {};
+    const m = message.message || {};
 
     return (
-        msg.conversation ||
-        msg.extendedTextMessage?.text ||
-        msg.imageMessage?.caption ||
-        msg.videoMessage?.caption ||
-        msg.documentMessage?.caption ||
-        msg.buttonsResponseMessage?.selectedButtonId ||
-        msg.listResponseMessage?.singleSelectReply?.selectedRowId ||
+        m.conversation ||
+        m.extendedTextMessage?.text ||
+        m.imageMessage?.caption ||
+        m.videoMessage?.caption ||
+        m.documentMessage?.caption ||
+        m.buttonsResponseMessage?.selectedButtonId ||
+        m.listResponseMessage?.singleSelectReply?.selectedRowId ||
         ""
     );
 }
 
-// ========================================
-// MESSAGE HANDLER
-// ========================================
-
 async function handleMessages(update) {
-    const { messages, type } = update;
+    if (update.type !== "notify") return;
 
-    if (type !== "notify") return;
-
-    for (const msg of messages) {
+    for (const msg of update.messages || []) {
         try {
             if (!msg.message || msg.key.fromMe) continue;
 
             const chat = msg.key.remoteJid;
             if (!chat || chat === "status@broadcast") continue;
 
-            const sender = msg.key.participant || chat;
             const text = getText(msg).trim();
-
             if (!text.startsWith(PREFIX)) continue;
 
             const parts = text.slice(PREFIX.length).trim().split(/\s+/);
-            const commandName = (parts.shift() || "").toLowerCase();
-            const args = parts;
-
-            if (!commandName) continue;
-
-            const plugin = commands.get(commandName);
+            const name = (parts.shift() || "").toLowerCase();
+            const plugin = commands.get(name);
 
             if (!plugin) continue;
 
+            const sender = msg.key.participant || chat;
             const owner = isOwner(sender);
 
             if (plugin.ownerOnly && !owner) {
                 await sock.sendMessage(chat, {
-                    text: "❌ මෙම Command එක Bot Owner සඳහා පමණයි."
+                    text: "This command is only for the bot owner."
                 }, { quoted: msg });
                 continue;
             }
 
-            const context = {
+            await plugin.handler(sock, msg, parts, {
                 sock,
                 msg,
-                args,
+                args: parts,
                 sender,
                 chat,
                 owner,
                 config,
-                database,
-                functions,
-                startTime,
-                uptime: () => Math.floor((Date.now() - startTime) / 1000)
-            };
+                startTime: global.startTime,
+                uptime: () => Math.floor((Date.now() - global.startTime) / 1000)
+            });
 
-            await plugin.handler(sock, msg, args, context);
-
-            if (config.COMMAND_LOGS) {
-                console.log(`[COMMAND] ${commandName} | ${chat}`);
-            }
-
+            console.log(`[COMMAND] ${name}`);
         } catch (error) {
-            console.error("[MESSAGE ERROR]", error);
-
-            try {
-                await sock.sendMessage(msg.key.remoteJid, {
-                    text: "❌ Command එක ක්‍රියාත්මක කිරීමේදී දෝෂයක් ඇතිවුණා."
-                }, { quoted: msg });
-            } catch (e) {
-                console.error("[REPLY ERROR]", e.message);
-            }
+            console.error("[MESSAGE ERROR]", error.message);
         }
     }
 }
 
-// ========================================
-// OWNER NOTIFICATION
-// ========================================
-
-async function notifyOwner() {
-    if (!config.OWNER_ALERTS || !OWNER_NUMBER) return;
-
-    try {
-        await sock.sendMessage(`${OWNER_NUMBER}@s.whatsapp.net`, {
-            text:
-                `✅ ${BOT_NAME} Connected!\n\n` +
-                `Version: ${config.VERSION}\n` +
-                `Status: Online\n` +
-                `Time: ${functions.getTime()}\n\n` +
-                `${config.FOOTER}`
-        });
-
-        console.log("[OWNER] Connection notification sent.");
-    } catch (error) {
-        console.error("[OWNER NOTIFICATION]", error.message);
-    }
-}
-
-// ========================================
-// START BOT
-// ========================================
-
 async function startBot() {
-    if (isStarting || isStopping) return;
+    if (stopping) return;
 
-    isStarting = true;
-    createDirectories();
+    cleanDirectories();
+    loadPlugins();
 
     try {
-        console.log(`\n========== ${BOT_NAME} ==========`);
-        console.log("[BOT] Starting...");
+        const hasSession = await restoreSession();
 
-        loadPlugins();
-
-        const {
-            state,
-            saveCreds
-        } = await useMultiFileAuthState(SESSION_DIR);
+        const { state, saveCreds } =
+            await useMultiFileAuthState(SESSION_DIR);
 
         const { version } = await fetchLatestBaileysVersion();
 
@@ -266,135 +272,91 @@ async function startBot() {
             auth: state,
             browser: Browsers.ubuntu("Chrome"),
             printQRInTerminal: false,
-            markOnlineOnConnect: config.ALWAYS_ONLINE || false,
-            syncFullHistory: false
+            syncFullHistory: false,
+            markOnlineOnConnect: false
         });
 
         sock.ev.on("creds.update", saveCreds);
-
         sock.ev.on("messages.upsert", handleMessages);
 
         sock.ev.on("connection.update", async (update) => {
-            const { connection, lastDisconnect, qr } = update;
+            const { connection, lastDisconnect } = update;
 
-            if (qr && config.QR_LOGIN) {
-                console.log("[LOGIN] QR code generated.");
-
-                try {
-                    const qrcode = require("qrcode-terminal");
-                    qrcode.generate(qr, { small: true });
-                } catch (error) {
-                    console.error("[QR ERROR]", error.message);
-                }
-            }
-
+            // QR login is intentionally disabled.
             if (connection === "connecting") {
                 console.log("[WHATSAPP] Connecting...");
             }
 
             if (connection === "open") {
-                console.log(`\n✅ ${BOT_NAME} CONNECTED!`);
-                console.log(`[BOT] Commands: ${commands.getAll().length}`);
-                console.log(`[BOT] Prefix: ${PREFIX}`);
+                console.log("✅ DARK DILA-MD CONNECTED!");
+                console.log(`[PLUGIN] Active commands: ${commands.size}`);
 
-                await notifyOwner();
+                if (!hasSession) {
+                    await uploadSession();
+                }
             }
 
             if (connection === "close") {
-                const statusCode =
-                    lastDisconnect?.error?.output?.statusCode;
+                const status = lastDisconnect?.error?.output?.statusCode;
 
-                console.log("[WHATSAPP] Connection closed:", statusCode);
+                console.log("[WHATSAPP] Connection closed:", status);
 
                 if (
-                    statusCode !== DisconnectReason.loggedOut &&
-                    config.AUTO_RECONNECT &&
-                    !isStopping
+                    status === DisconnectReason.loggedOut ||
+                    !config.AUTO_RECONNECT
                 ) {
-                    console.log("[BOT] Reconnecting...");
-
-                    clearTimeout(reconnectTimer);
-
-                    reconnectTimer = setTimeout(() => {
-                        isStarting = false;
-                        startBot();
-                    }, Number(config.RECONNECT_DELAY) || 5000);
-                } else {
-                    console.log("[BOT] Login required. Check your session.");
+                    console.log("[WHATSAPP] Session logged out. New Pair Code required.");
+                    return;
                 }
+
+                clearTimeout(reconnectTimer);
+                reconnectTimer = setTimeout(() => {
+                    startBot();
+                }, Number(config.RECONNECT_DELAY) || 5000);
             }
         });
 
-        // ========================================
-        // PAIR CODE LOGIN
-        // ========================================
+        if (!state.creds.registered && !hasSession && !pairingStarted) {
+            pairingStarted = true;
 
-        if (
-            !state.creds.registered &&
-            config.PAIR_CODE_LOGIN &&
-            config.LOGIN_METHOD !== "qr"
-        ) {
-            const number = String(config.PAIRING_NUMBER || "")
-                .replace(/\D/g, "");
+            const number = String(
+                process.env.PAIRING_NUMBER || ""
+            ).replace(/\D/g, "");
 
             if (!number) {
-                console.log("[LOGIN] Add PAIRING_NUMBER in config.js");
-            } else {
-                const code = await sock.requestPairingCode(number);
-
-                console.log("\n================================");
-                console.log("       DARK DILA-MD PAIR CODE");
-                console.log("================================");
-                console.log(code);
-                console.log("================================\n");
+                throw new Error("Add PAIRING_NUMBER in GitHub Secrets.");
             }
-        }
 
-        isStarting = false;
+            await new Promise(resolve => setTimeout(resolve, 3000));
+
+            const code = await sock.requestPairingCode(number);
+
+            console.log("\n================================");
+            console.log(" DARK DILA-MD PAIR CODE");
+            console.log(code);
+            console.log("================================\n");
+        }
 
     } catch (error) {
-        isStarting = false;
-
-        console.error("[START ERROR]", error);
-
-        if (config.AUTO_RECONNECT && !isStopping) {
-            clearTimeout(reconnectTimer);
-
-            reconnectTimer = setTimeout(() => {
-                startBot();
-            }, Number(config.RECONNECT_DELAY) || 5000);
-        }
+        console.error("[START ERROR]", error.message);
+        process.exitCode = 1;
     }
 }
 
-// ========================================
-// SHUTDOWN
-// ========================================
+global.startTime = Date.now();
 
-async function shutdown() {
-    if (isStopping) return;
-
-    isStopping = true;
+process.on("SIGINT", () => {
+    stopping = true;
     clearTimeout(reconnectTimer);
-
-    console.log("[BOT] Shutting down...");
-
-    try {
-        if (sock) {
-            sock.end(undefined);
-        }
-    } catch (error) {
-        console.error("[SHUTDOWN ERROR]", error.message);
-    }
-
+    if (sock) sock.end(undefined);
     process.exit(0);
-}
+});
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-
-// ========================================
-// START
-// ========================================
+process.on("SIGTERM", () => {
+    stopping = true;
+    clearTimeout(reconnectTimer);
+    if (sock) sock.end(undefined);
+    process.exit(0);
+});
 
 startBot();
