@@ -11,7 +11,6 @@ const path = require("path");
 const crypto = require("crypto");
 
 const config = require("./config");
-const settings = require("./settings");
 
 const PREFIX = config.PREFIX;
 const plugins = [];
