@@ -320,8 +320,11 @@ async function startBot() {
             pairingStarted = true;
 
             const number = String(
-                process.env.PAIRING_NUMBER || ""
-            ).replace(/\D/g, "");
+    process.env.PAIRING_NUMBER ||
+    process.env.OWNER_NUMBER ||
+    config.OWNER_NUMBER ||
+    ""
+).replace(/\D/g, "");
 
             if (!number) {
                 throw new Error("Add PAIRING_NUMBER in GitHub Secrets.");
