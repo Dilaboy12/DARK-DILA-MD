@@ -21,7 +21,7 @@ const config = {
   OWNER_ALERTS: true,
 
   // SESSION SETTINGS
-  SESSION_ID: process.env.SESSION_ID || "",
+  SESSION_ID: process.env.SESSION_ID || "THENUVA-XMD=pvZ0VbpD#vx9art6w7v-xuS4HUd_Yyd8Fh1SbZV69gdUZ61aGTl0",
   SESSION_PREFIX: "THENUVA-XMD=",
   SESSION_AUTO_SAVE: true,
   SESSION_AUTO_RESTORE: true,
