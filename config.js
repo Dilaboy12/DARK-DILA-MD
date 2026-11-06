@@ -22,7 +22,7 @@ const config = {
 
   // SESSION SETTINGS
   SESSION_ID: process.env.SESSION_ID || "",
-  SESSION_PREFIX: "DARK-DILA-MD=",
+  SESSION_PREFIX: "THENUVA-XMD=",
   SESSION_AUTO_SAVE: true,
   SESSION_AUTO_RESTORE: true,
 
